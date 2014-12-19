@@ -103,6 +103,37 @@ struct srv_stats_t {
 	a disk page */
 	ulint_ctr_1_t		buf_pool_reads;
 
+	/** Number of bytes saved by page compression */
+	ulint_ctr_64_t          page_compression_saved;
+	/** Number of 512Byte TRIM by page compression */
+	ulint_ctr_64_t          page_compression_trim_sect512;
+	/** Number of 1K TRIM by page compression */
+	ulint_ctr_64_t          page_compression_trim_sect1024;
+	/** Number of 2K TRIM by page compression */
+	ulint_ctr_64_t          page_compression_trim_sect2048;
+	/** Number of 4K TRIM  by page compression */
+	ulint_ctr_64_t          page_compression_trim_sect4096;
+	/** Number of 8K TRIM by page compression */
+	ulint_ctr_64_t          page_compression_trim_sect8192;
+	/** Number of 16K TRIM by page compression */
+	ulint_ctr_64_t          page_compression_trim_sect16384;
+	/** Number of 32K TRIM by page compression */
+	ulint_ctr_64_t          page_compression_trim_sect32768;
+	/* Number of index pages written */
+	ulint_ctr_64_t          index_pages_written;
+	/* Number of non index pages written */
+	ulint_ctr_64_t          non_index_pages_written;
+	/* Number of pages compressed with page compression */
+        ulint_ctr_64_t          pages_page_compressed;
+	/* Number of TRIM operations induced by page compression */
+        ulint_ctr_64_t          page_compressed_trim_op;
+	/* Number of TRIM operations saved by using actual write size knowledge */
+        ulint_ctr_64_t          page_compressed_trim_op_saved;
+	/* Number of pages decompressed with page compression */
+        ulint_ctr_64_t          pages_page_decompressed;
+	/* Number of page compression errors */
+	ulint_ctr_64_t          pages_page_compression_error;
+
 	/** Number of data read in total (in bytes) */
 	ulint_ctr_1_t		data_read;
 
@@ -256,6 +287,28 @@ extern my_bool	srv_use_native_aio;
 extern ibool	srv_use_native_conditions;
 #endif /* __WIN__ */
 #endif /* !UNIV_HOTBACKUP */
+
+/* Use trim operation */
+extern my_bool srv_use_trim;
+
+/* Use posix fallocate */
+extern my_bool srv_use_posix_fallocate;
+
+/* Use atomic writes i.e disable doublewrite buffer */
+extern my_bool srv_use_atomic_writes;
+
+/* Compression algorithm*/
+extern ulong innodb_compression_algorithm;
+
+/* Number of flush threads */
+#define MTFLUSH_MAX_WORKER       64
+#define MTFLUSH_DEFAULT_WORKER   8
+
+/* Number of threads used for multi-threaded flush */
+extern long    srv_mtflush_threads;
+
+/* If this flag is TRUE, then we will use multi threaded flush. */
+extern my_bool	srv_use_mtflush;
 
 /** Server undo tablespaces directory, can be absolute path. */
 extern char*	srv_undo_dir;
@@ -432,10 +485,6 @@ extern my_bool			srv_stats_sample_traditional;
 
 extern ibool	srv_use_doublewrite_buf;
 extern ulong	srv_doublewrite_batch_size;
-extern ibool	srv_use_atomic_writes;
-#ifdef HAVE_POSIX_FALLOCATE
-extern ibool	srv_use_posix_fallocate;
-#endif
 extern ulong	srv_checksum_algorithm;
 
 extern ulong	srv_log_arch_expire_sec;
@@ -1089,6 +1138,39 @@ struct export_var_t{
 	ulint innodb_purge_view_trx_id_age;	/*!< rw_max_trx_id
 						- purged view's min trx_id */
 #endif /* UNIV_DEBUG */
+
+
+	ib_int64_t innodb_page_compression_saved;/*!< Number of bytes saved
+						by page compression */
+	ib_int64_t innodb_page_compression_trim_sect512;/*!< Number of 512b TRIM
+						by page compression */
+	ib_int64_t innodb_page_compression_trim_sect1024;/*!< Number of 1K TRIM
+						by page compression */
+	ib_int64_t innodb_page_compression_trim_sect2048;/*!< Number of 2K TRIM
+						by page compression */
+	ib_int64_t innodb_page_compression_trim_sect4096;/*!< Number of 4K byte TRIM
+						by page compression */
+	ib_int64_t innodb_page_compression_trim_sect8192;/*!< Number of 8K TRIM
+						by page compression */
+	ib_int64_t innodb_page_compression_trim_sect16384;/*!< Number of 16K TRIM
+						by page compression */
+	ib_int64_t innodb_page_compression_trim_sect32768;/*!< Number of 32K TRIM
+						by page compression */
+	ib_int64_t innodb_index_pages_written;  /*!< Number of index pages
+						written */
+	ib_int64_t innodb_non_index_pages_written;  /*!< Number of non index pages
+						written */
+	ib_int64_t innodb_pages_page_compressed;/*!< Number of pages
+						compressed by page compression */
+	ib_int64_t innodb_page_compressed_trim_op;/*!< Number of TRIM operations
+						induced by page compression */
+	ib_int64_t innodb_page_compressed_trim_op_saved;/*!< Number of TRIM operations
+						saved by page compression */
+	ib_int64_t innodb_pages_page_decompressed;/*!< Number of pages
+						decompressed by page
+						compression */
+	ib_int64_t innodb_pages_page_compression_error;/*!< Number of page
+						compression errors */
 };
 
 /** Thread slot in the thread table.  */

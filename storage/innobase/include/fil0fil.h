@@ -1,6 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1995, 2014, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2013, 2014, SkySQL Ab. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -126,11 +127,33 @@ extern fil_addr_t	fil_addr_null;
 					data file (ibdata*, not *.ibd):
 					the file has been flushed to disk
 					at least up to this lsn */
+/** If page type is FIL_PAGE_COMPRESSED then the 8 bytes starting at
+FIL_PAGE_FILE_FLUSH_LSN are broken down as follows: */
+
+/** Control information version format (u8) */
+static const ulint FIL_PAGE_VERSION = FIL_PAGE_FILE_FLUSH_LSN;
+
+/** Compression algorithm (u8) */
+static const ulint FIL_PAGE_ALGORITHM_V1 = FIL_PAGE_VERSION + 1;
+
+/** Original page type (u16) */
+static const ulint FIL_PAGE_ORIGINAL_TYPE_V1 = FIL_PAGE_ALGORITHM_V1 + 1;
+
+/** Original data size in bytes (u16)*/
+static const ulint FIL_PAGE_ORIGINAL_SIZE_V1 = FIL_PAGE_ORIGINAL_TYPE_V1 + 2;
+
+/** Size after compression (u16)*/
+static const ulint FIL_PAGE_COMPRESS_SIZE_V1 = FIL_PAGE_ORIGINAL_SIZE_V1 + 2;
+
 #define FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID  34 /*!< starting from 4.1.x this
 					contains the space id of the page */
 #define FIL_PAGE_SPACE_ID  FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID
 
 #define FIL_PAGE_DATA		38	/*!< start of the data on the page */
+/* Following are used when page compression is used */
+#define FIL_PAGE_COMPRESSED_SIZE 2      /*!< Number of bytes used to store
+ 					actual payload data size on
+ 					compressed pages. */
 /* @} */
 /** File page trailer @{ */
 #define FIL_PAGE_END_LSN_OLD_CHKSUM 8	/*!< the low 4 bytes of this are used
@@ -143,6 +166,7 @@ extern fil_addr_t	fil_addr_null;
 #ifndef UNIV_INNOCHECKSUM
 
 /** File page types (values of FIL_PAGE_TYPE) @{ */
+#define FIL_PAGE_PAGE_COMPRESSED 34354  /*!< page compressed page */
 #define FIL_PAGE_INDEX		17855	/*!< B-tree node */
 #define FIL_PAGE_UNDO_LOG	2	/*!< Undo log page */
 #define FIL_PAGE_INODE		3	/*!< Index node */
@@ -157,7 +181,8 @@ extern fil_addr_t	fil_addr_null;
 #define FIL_PAGE_TYPE_BLOB	10	/*!< Uncompressed BLOB page */
 #define FIL_PAGE_TYPE_ZBLOB	11	/*!< First compressed BLOB page */
 #define FIL_PAGE_TYPE_ZBLOB2	12	/*!< Subsequent compressed BLOB page */
-#define FIL_PAGE_TYPE_LAST	FIL_PAGE_TYPE_ZBLOB2
+#define FIL_PAGE_TYPE_COMPRESSED	13	/*!< Compressed page */
+#define FIL_PAGE_TYPE_LAST	FIL_PAGE_TYPE_COMPRESSED
 					/*!< Last page type */
 /* @} */
 
@@ -223,6 +248,7 @@ struct fil_node_t {
 	ib_int64_t	flush_counter;/*!< up to what
 				modification_counter value we have
 				flushed the modifications to disk */
+	ulint		file_block_size;
 	UT_LIST_NODE_T(fil_node_t) chain;
 				/*!< link field for the file chain */
 	UT_LIST_NODE_T(fil_node_t) LRU;
@@ -396,6 +422,7 @@ ulint
 fil_space_get_type(
 /*===============*/
 	ulint	id);	/*!< in: space id */
+
 #endif /* !UNIV_HOTBACKUP */
 /*******************************************************************//**
 Appends a new file to the chain of files of a space. File must be closed.
@@ -575,8 +602,10 @@ fil_read_first_page(
 #endif /* UNIV_LOG_ARCHIVE */
 	lsn_t*		min_flushed_lsn,	/*!< out: min of flushed
 						lsn values in data files */
-	lsn_t*		max_flushed_lsn)	/*!< out: max of flushed
+	lsn_t*		max_flushed_lsn,	/*!< out: max of flushed
 						lsn values in data files */
+	ulint		orig_space_id)		/*!< in: file space id or
+						ULINT_UNDEFINED */
 	__attribute__((warn_unused_result));
 /*******************************************************************//**
 Increments the count of pending operation, if space is not being deleted.
@@ -939,8 +968,13 @@ fil_io(
 	void*	buf,		/*!< in/out: buffer where to store read data
 				or from where to write; in aio this must be
 				appropriately aligned */
-	void*	message)	/*!< in: message for aio handler if non-sync
+	void*	message,	/*!< in: message for aio handler if non-sync
 				aio used, else ignored */
+	ulint*	write_size)	/*!< in/out: Actual write size initialized
+			       after fist successfull trim
+			       operation for this page and if
+			       initialized we do not trim again if
+			       actual page size does not decrease. */
 	__attribute__((nonnull(8)));
 /**********************************************************************//**
 Waits for an aio operation to complete. This function is used to write the
@@ -1192,4 +1226,38 @@ fil_user_tablespace_restore_page(
 					write buffer */
 
 #endif /* !UNIV_INNOCHECKSUM */
+
+/****************************************************************//**
+Acquire fil_system mutex */
+void
+fil_system_enter(void);
+/*==================*/
+/****************************************************************//**
+Release fil_system mutex */
+void
+fil_system_exit(void);
+/*==================*/
+
+#ifndef UNIV_INNOCHECKSUM
+/*******************************************************************//**
+Returns the table space by a given id, NULL if not found. */
+fil_space_t*
+fil_space_get_by_id(
+/*================*/
+	ulint	id);	/*!< in: space id */
+/*******************************************************************//**
+Return space name */
+char*
+fil_space_name(
+/*===========*/
+	fil_space_t*	space);	/*!< in: space */
+#endif
+
+/*******************************************************************//**
+Return page type name */
+const char*
+fil_get_page_type_name(
+/*===================*/
+	ulint	page_type);	/*!< in: FIL_PAGE_TYPE */
+
 #endif /* fil0fil_h */

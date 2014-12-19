@@ -122,6 +122,8 @@ public:
   Item_bool_func() :Item_int_func() {}
   Item_bool_func(Item *a) :Item_int_func(a) {}
   Item_bool_func(Item *a,Item *b) :Item_int_func(a,b) {}
+  Item_bool_func(Item *a, Item *b, Item *c) :Item_int_func(a, b, c) {}
+  Item_bool_func(List<Item> &list) :Item_int_func(list) { }
   Item_bool_func(THD *thd, Item_bool_func *item) :Item_int_func(thd, item) {}
   bool is_bool_func() { return 1; }
   void fix_length_and_dec() { decimals=0; max_length=1; }
@@ -364,7 +366,7 @@ public:
   virtual bool l_op() const { return 1; }
 };
 
-class Item_bool_func2 :public Item_int_func
+class Item_bool_func2 :public Item_bool_func
 {						/* Bool with 2 string args */
 protected:
   Arg_comparator cmp;
@@ -372,7 +374,7 @@ protected:
 
 public:
   Item_bool_func2(Item *a,Item *b)
-    :Item_int_func(a,b), cmp(tmp_arg, tmp_arg+1),
+    :Item_bool_func(a,b), cmp(tmp_arg, tmp_arg+1),
      abort_on_null(FALSE) { sargable= TRUE; }
   void fix_length_and_dec();
   int set_cmp_func()
@@ -389,14 +391,12 @@ public:
   }
 
   bool is_null() { return MY_TEST(args[0]->is_null() || args[1]->is_null()); }
-  bool is_bool_func() { return 1; }
   CHARSET_INFO *compare_collation() { return cmp.cmp_collation.collation; }
-  uint decimal_precision() const { return 1; }
   void top_level_item() { abort_on_null= TRUE; }
   Arg_comparator *get_comparator() { return &cmp; }
   void cleanup()
   {
-    Item_int_func::cleanup();
+    Item_bool_func::cleanup();
     cmp.cleanup();
   }
 
@@ -646,16 +646,16 @@ public:
 
 */
 
-class Item_func_opt_neg :public Item_int_func
+class Item_func_opt_neg :public Item_bool_func
 {
 public:
   bool negated;     /* <=> the item represents NOT <func> */
   bool pred_level;  /* <=> [NOT] <func> is used on a predicate level */
 public:
   Item_func_opt_neg(Item *a, Item *b, Item *c)
-    :Item_int_func(a, b, c), negated(0), pred_level(0) {}
+    :Item_bool_func(a, b, c), negated(0), pred_level(0) {}
   Item_func_opt_neg(List<Item> &list)
-    :Item_int_func(list), negated(0), pred_level(0) {}
+    :Item_bool_func(list), negated(0), pred_level(0) {}
 public:
   inline void negate() { negated= !negated; }
   inline void top_level_item() { pred_level= 1; }
@@ -686,9 +686,7 @@ public:
   bool fix_fields(THD *, Item **);
   void fix_length_and_dec();
   virtual void print(String *str, enum_query_type query_type);
-  bool is_bool_func() { return 1; }
   CHARSET_INFO *compare_collation() { return cmp_collation.collation; }
-  uint decimal_precision() const { return 1; }
   bool eval_not_null_tables(uchar *opt_arg);
   void fix_after_pullout(st_select_lex *new_parent, Item **ref);
   bool count_sargable_conds(uchar *arg);
@@ -1316,7 +1314,6 @@ public:
   longlong val_int();
   bool fix_fields(THD *, Item **);
   void fix_length_and_dec();
-  uint decimal_precision() const { return 1; }
   void cleanup()
   {
     uint i;
@@ -1337,7 +1334,6 @@ public:
   enum Functype functype() const { return IN_FUNC; }
   const char *func_name() const { return " IN "; }
   bool nulls_in_row();
-  bool is_bool_func() { return 1; }
   CHARSET_INFO *compare_collation() { return cmp_collation.collation; }
   bool eval_not_null_tables(uchar *opt_arg);
   void fix_after_pullout(st_select_lex *new_parent, Item **ref);
@@ -1490,7 +1486,42 @@ public:
   longlong val_int();
   enum Functype functype() const { return LIKE_FUNC; }
   optimize_type select_optimize() const;
-  cond_result eq_cmp_result() const { return COND_TRUE; }
+  cond_result eq_cmp_result() const
+  {
+    /**
+      We cannot always rewrite conditions as follows:
+        from:  WHERE expr1=const AND expr1 LIKE expr2
+        to:    WHERE expr1=const AND const LIKE expr2
+      or
+        from:  WHERE expr1=const AND expr2 LIKE expr1
+        to:    WHERE expr1=const AND expr2 LIKE const
+
+      because LIKE works differently comparing to the regular "=" operator:
+
+      1. LIKE performs a stricter one-character-to-one-character comparison
+         and does not recognize contractions and expansions.
+         Replacing "expr1" to "const in LIKE would make the condition
+         stricter in case of a complex collation.
+
+      2. LIKE does not ignore trailing spaces and thus works differently
+         from the "=" operator in case of "PAD SPACE" collations
+         (which are the majority in MariaDB). So, for "PAD SPACE" collations:
+
+         - expr1=const       - ignores trailing spaces
+         - const LIKE expr2  - does not ignore trailing spaces
+         - expr2 LIKE const  - does not ignore trailing spaces
+
+      Allow only "binary" for now.
+      It neither ignores trailing spaces nor has contractions/expansions.
+
+      TODO:
+      We could still replace "expr1" to "const" in "expr1 LIKE expr2"
+      in case of a "PAD SPACE" collation, but only if "expr2" has '%'
+      at the end.         
+    */
+    return ((Item_func_like *)this)->compare_collation() == &my_charset_bin ?
+           COND_TRUE : COND_OK;
+  }
   const char *func_name() const { return "like"; }
   bool fix_fields(THD *thd, Item **ref);
   void cleanup();

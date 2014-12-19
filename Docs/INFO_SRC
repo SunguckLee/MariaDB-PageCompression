@@ -1,8 +1,8 @@
-revision-id: sergii@pisem.net-20141121192039-d0lv6cj96kg5pw02
-date: 2014-11-21 20:20:39 +0100
-build-date: 2014-11-21 22:02:58 +0100
-revno: 4506
-branch-nick: 10.0
+revision-id: jplindst@mariadb.org-20141204111951-b37hz4nbzl1wngvq
+date: 2014-12-04 13:19:51 +0200
+build-date: 2014-12-10 16:38:46 +0100
+revno: 4009
+branch-nick: 10.0-FusionIO
 
 
 MySQL source 10.0.15

@@ -101,6 +101,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #endif /* UNIV_DEBUG */
 #include "fts0priv.h"
 #include "page0zip.h"
+#include "fil0pagecompress.h"
 
 #define thd_get_trx_isolation(X) ((enum_tx_isolation)thd_tx_isolation(X))
 
@@ -501,6 +502,28 @@ ib_cb_t innodb_api_cb[] = {
 	(ib_cb_t) ib_cursor_stmt_begin
 };
 
+/**
+  Structure for CREATE TABLE options (table options).
+  It needs to be called ha_table_option_struct.
+
+  The option values can be specified in the CREATE TABLE at the end:
+  CREATE TABLE ( ... ) *here*
+*/
+
+ha_create_table_option innodb_table_option_list[]=
+{
+  /* With this option user can enable page compression feature for the
+  table */
+  HA_TOPTION_BOOL("PAGE_COMPRESSED", page_compressed, 0),
+  /* With this option user can set zip compression level for page
+  compression for this table*/
+  HA_TOPTION_NUMBER("PAGE_COMPRESSION_LEVEL", page_compression_level, ULINT_UNDEFINED, 0, 9, 1),
+  /* With this option user can enable atomic writes feature for this table */
+  HA_TOPTION_ENUM("ATOMIC_WRITES", atomic_writes, "DEFAULT,ON,OFF", 0),
+  HA_TOPTION_END
+};
+
+
 /*************************************************************//**
 Check whether valid argument given to innodb_ft_*_stopword_table.
 This function is registered as a callback with MySQL.
@@ -536,7 +559,27 @@ static inline
 ulint
 innobase_map_isolation_level(
 /*=========================*/
-	enum_tx_isolation	iso);	/*!< in: MySQL isolation level code */
+	enum_tx_isolation	iso);	/*!< in: MySQL isolation level code
+					*/
+
+/*************************************************************//**
+Check for a valid value of innobase_compression_algorithm.
+@return	0 for valid innodb_compression_algorithm. */
+static
+int
+innodb_compression_algorithm_validate(
+/*==================================*/
+	THD*				thd,	/*!< in: thread handle */
+	struct st_mysql_sys_var*	var,	/*!< in: pointer to system
+						variable */
+	void*				save,	/*!< out: immediate result
+						for update function */
+	struct st_mysql_value*		value);	/*!< in: incoming string */
+
+static ibool innodb_have_lzo=IF_LZO(1, 0);
+static ibool innodb_have_lz4=IF_LZ4(1, 0);
+static ibool innodb_have_lzma=IF_LZMA(1, 0);
+static ibool innodb_have_bzip2=IF_BZIP2(1, 0);
 
 static const char innobase_hton_name[]= "InnoDB";
 
@@ -689,6 +732,44 @@ static SHOW_VAR innodb_status_variables[]= {
   {"purge_view_trx_id_age",
   (char*) &export_vars.innodb_purge_view_trx_id_age,      SHOW_LONG},
 #endif /* UNIV_DEBUG */
+  /* Status variables for page compression */
+  {"page_compression_saved",
+   (char*) &export_vars.innodb_page_compression_saved,    SHOW_LONGLONG},
+  {"page_compression_trim_sect512",
+   (char*) &export_vars.innodb_page_compression_trim_sect512,    SHOW_LONGLONG},
+  {"page_compression_trim_sect1024",
+   (char*) &export_vars.innodb_page_compression_trim_sect1024,    SHOW_LONGLONG},
+  {"page_compression_trim_sect2048",
+   (char*) &export_vars.innodb_page_compression_trim_sect2048,    SHOW_LONGLONG},
+  {"page_compression_trim_sect4096",
+   (char*) &export_vars.innodb_page_compression_trim_sect4096,    SHOW_LONGLONG},
+  {"page_compression_trim_sect8192",
+   (char*) &export_vars.innodb_page_compression_trim_sect8192,    SHOW_LONGLONG},
+  {"page_compression_trim_sect16384",
+   (char*) &export_vars.innodb_page_compression_trim_sect16384,    SHOW_LONGLONG},
+  {"page_compression_trim_sect32768",
+   (char*) &export_vars.innodb_page_compression_trim_sect32768,    SHOW_LONGLONG},
+  {"num_index_pages_written",
+   (char*) &export_vars.innodb_index_pages_written,       SHOW_LONGLONG},
+  {"num_non_index_pages_written",
+   (char*) &export_vars.innodb_non_index_pages_written,       SHOW_LONGLONG},
+  {"num_pages_page_compressed",
+   (char*) &export_vars.innodb_pages_page_compressed,     SHOW_LONGLONG},
+  {"num_page_compressed_trim_op",
+   (char*) &export_vars.innodb_page_compressed_trim_op,     SHOW_LONGLONG},
+  {"num_page_compressed_trim_op_saved",
+   (char*) &export_vars.innodb_page_compressed_trim_op_saved,     SHOW_LONGLONG},
+  {"num_pages_page_decompressed",
+   (char*) &export_vars.innodb_pages_page_decompressed,   SHOW_LONGLONG},
+  {"have_lz4",
+  (char*) &innodb_have_lz4,		  SHOW_BOOL},
+  {"have_lzo",
+  (char*) &innodb_have_lzo,		  SHOW_BOOL},
+  {"have_lzma",
+  (char*) &innodb_have_lzma,		  SHOW_BOOL},
+  {"have_bzip2",
+  (char*) &innodb_have_bzip2,		  SHOW_BOOL},
+
   {NullS, NullS, SHOW_LONG}
 };
 
@@ -2912,6 +2993,8 @@ innobase_init(
         if (srv_file_per_table)
           innobase_hton->tablefile_extensions = ha_innobase_exts;
 
+	innobase_hton->table_options = innodb_table_option_list;
+
 	ut_a(DATA_MYSQL_TRUE_VARCHAR == (ulint)MYSQL_TYPE_VARCHAR);
 
 #ifndef DBUG_OFF
@@ -2945,6 +3028,42 @@ innobase_init(
 			goto error;
 		}
 	}
+
+#ifndef HAVE_LZ4
+	if (innodb_compression_algorithm == PAGE_LZ4_ALGORITHM) {
+		sql_print_error("InnoDB: innodb_compression_algorithm = %lu unsupported.\n"
+				"InnoDB: liblz4 is not installed. \n",
+				innodb_compression_algorithm);
+	        goto error;
+	}
+#endif
+
+#ifndef HAVE_LZO
+	if (innodb_compression_algorithm == PAGE_LZO_ALGORITHM) {
+		sql_print_error("InnoDB: innodb_compression_algorithm = %lu unsupported.\n"
+				"InnoDB: liblzo is not installed. \n",
+				innodb_compression_algorithm);
+		goto error;
+	}
+#endif
+
+#ifndef HAVE_LZMA
+	if (innodb_compression_algorithm == PAGE_LZMA_ALGORITHM) {
+		sql_print_error("InnoDB: innodb_compression_algorithm = %lu unsupported.\n"
+				"InnoDB: liblzma is not installed. \n",
+				innodb_compression_algorithm);
+		goto error;
+	}
+#endif
+
+#ifndef HAVE_BZIP2
+	if (innodb_compression_algorithm == PAGE_BZIP2_ALGORITHM) {
+		sql_print_error("InnoDB: innodb_compression_algorithm = %lu unsupported.\n"
+				"InnoDB: libbz2 is not installed. \n",
+				innodb_compression_algorithm);
+		goto error;
+	}
+#endif
 
 	os_innodb_umask = (ulint) my_umask;
 
@@ -9655,10 +9774,15 @@ innobase_table_flags(
 	enum row_type	row_format;
 	rec_format_t	innodb_row_format = REC_FORMAT_COMPACT;
 	bool		use_data_dir;
+	ha_table_option_struct *options= form->s->option_struct;
 
 	/* Cache the value of innodb_file_format, in case it is
 	modified by another thread while the table is being created. */
 	const ulint	file_format_allowed = srv_file_format;
+
+	/* Cache the value of innobase_compression_level, in case it is
+	modified by another thread while the table is being created. */
+	const ulint     default_compression_level = page_zip_level;
 
 	*flags = 0;
 	*flags2 = 0;
@@ -9713,6 +9837,8 @@ index_bad:
 		}
 	}
 
+	row_format = form->s->row_type;
+
 	if (create_info->key_block_size) {
 		/* The requested compressed page size (key_block_size)
 		is given in kilobytes. If it is a valid number, store
@@ -9722,7 +9848,7 @@ index_bad:
 		ulint kbsize;		/* Key Block Size */
 		for (zssize = kbsize = 1;
 		     zssize <= ut_min(UNIV_PAGE_SSIZE_MAX,
-				      PAGE_ZIP_SSIZE_MAX);
+			     	      PAGE_ZIP_SSIZE_MAX);
 		     zssize++, kbsize <<= 1) {
 			if (kbsize == create_info->key_block_size) {
 				zip_ssize = zssize;
@@ -9750,8 +9876,8 @@ index_bad:
 		}
 
 		if (!zip_allowed
-		    || zssize > ut_min(UNIV_PAGE_SSIZE_MAX,
-				       PAGE_ZIP_SSIZE_MAX)) {
+			|| zssize > ut_min(UNIV_PAGE_SSIZE_MAX,
+					   PAGE_ZIP_SSIZE_MAX)) {
 			push_warning_printf(
 				thd, Sql_condition::WARN_LEVEL_WARN,
 				ER_ILLEGAL_HA_CREATE_OPTION,
@@ -9759,8 +9885,6 @@ index_bad:
 				create_info->key_block_size);
 		}
 	}
-
-	row_format = form->s->row_type;
 
 	if (zip_ssize && zip_allowed) {
 		/* if ROW_FORMAT is set to default,
@@ -9798,7 +9922,6 @@ index_bad:
 	case ROW_TYPE_REDUNDANT:
 		innodb_row_format = REC_FORMAT_REDUNDANT;
 		break;
-
 	case ROW_TYPE_COMPRESSED:
 	case ROW_TYPE_DYNAMIC:
 		if (!use_tablespace) {
@@ -9816,10 +9939,18 @@ index_bad:
 				" innodb_file_format > Antelope.",
 				get_row_format_name(row_format));
 		} else {
-			innodb_row_format = (row_format == ROW_TYPE_DYNAMIC
-					     ? REC_FORMAT_DYNAMIC
-					     : REC_FORMAT_COMPRESSED);
-			break;
+			switch(row_format) {
+			  case ROW_TYPE_COMPRESSED:
+			    innodb_row_format = REC_FORMAT_COMPRESSED;
+			    break;
+			  case ROW_TYPE_DYNAMIC:
+			    innodb_row_format = REC_FORMAT_DYNAMIC;
+                            break;
+			  default:
+			    /* Not possible, avoid compiler warning */
+			    break;
+			}
+			break; /* Correct row_format */
 		}
 		zip_allowed = FALSE;
 		/* fall through to set row_format = COMPACT */
@@ -9846,7 +9977,15 @@ index_bad:
 		       && ((create_info->data_file_name != NULL)
 		       && !(create_info->options & HA_LEX_CREATE_TMP_TABLE));
 
-	dict_tf_set(flags, innodb_row_format, zip_ssize, use_data_dir);
+	/* Set up table dictionary flags */
+	dict_tf_set(flags,
+		    innodb_row_format,
+		    zip_ssize,
+		    use_data_dir,
+		    options->page_compressed,
+		    (ulint)options->page_compression_level == ULINT_UNDEFINED ?
+		        default_compression_level : options->page_compression_level,
+		    options->atomic_writes);
 
 	if (create_info->options & HA_LEX_CREATE_TMP_TABLE) {
 		*flags2 |= DICT_TF2_TEMPORARY;
@@ -9862,6 +10001,114 @@ index_bad:
 			*flags2 &= ~DICT_TF2_FTS_AUX_HEX_NAME;);
 
 	DBUG_RETURN(true);
+}
+
+
+/*****************************************************************//**
+Check engine specific table options not handled by SQL-parser.
+@return	NULL if valid, string if not */
+UNIV_INTERN
+const char*
+ha_innobase::check_table_options(
+	THD		*thd,		/*!< in: thread handle */
+	TABLE*		table,		/*!< in: information on table
+					columns and indexes */
+	HA_CREATE_INFO*	create_info,	/*!< in: more information of the
+					created table, contains also the
+					create statement string */
+	const bool	use_tablespace, /*!< in: use file par table */
+	const ulint     file_format)
+{
+	enum row_type	row_format = table->s->row_type;;
+	ha_table_option_struct *options= table->s->option_struct;
+	atomic_writes_t awrites = (atomic_writes_t)options->atomic_writes;
+
+	/* Check page compression requirements */
+	if (options->page_compressed) {
+
+		if (row_format == ROW_TYPE_COMPRESSED) {
+			push_warning(
+				thd, Sql_condition::WARN_LEVEL_WARN,
+				HA_WRONG_CREATE_OPTION,
+				"InnoDB: PAGE_COMPRESSED table can't have"
+				" ROW_TYPE=COMPRESSED");
+			return "PAGE_COMPRESSED";
+		}
+
+		if (row_format == ROW_TYPE_REDUNDANT) {
+			push_warning(
+				thd, Sql_condition::WARN_LEVEL_WARN,
+				HA_WRONG_CREATE_OPTION,
+				"InnoDB: PAGE_COMPRESSED table can't have"
+				" ROW_TYPE=REDUNDANT");
+			return "PAGE_COMPRESSED";
+		}
+
+		if (!use_tablespace) {
+			push_warning(
+				thd, Sql_condition::WARN_LEVEL_WARN,
+				HA_WRONG_CREATE_OPTION,
+				"InnoDB: PAGE_COMPRESSED requires"
+				" innodb_file_per_table.");
+			return "PAGE_COMPRESSED";
+		}
+
+		if (file_format < UNIV_FORMAT_B) {
+			push_warning(
+				thd, Sql_condition::WARN_LEVEL_WARN,
+				HA_WRONG_CREATE_OPTION,
+				"InnoDB: PAGE_COMPRESSED requires"
+				" innodb_file_format > Antelope.");
+			return "PAGE_COMPRESSED";
+		}
+
+		if (create_info->key_block_size) {
+			push_warning(
+				thd, Sql_condition::WARN_LEVEL_WARN,
+				HA_WRONG_CREATE_OPTION,
+				"InnoDB: PAGE_COMPRESSED table can't have"
+				" key_block_size");
+			return "PAGE_COMPRESSED";
+		}
+	}
+
+	/* Check page compression level requirements, some of them are
+	already checked above */
+	if ((ulint)options->page_compression_level != ULINT_UNDEFINED) {
+		if (options->page_compressed == false) {
+			push_warning(
+				thd, Sql_condition::WARN_LEVEL_WARN,
+				HA_WRONG_CREATE_OPTION,
+				"InnoDB: PAGE_COMPRESSION_LEVEL requires"
+				" PAGE_COMPRESSED");
+			return "PAGE_COMPRESSION_LEVEL";
+		}
+
+		if (options->page_compression_level < 0 || options->page_compression_level > 9) {
+			push_warning_printf(
+				thd, Sql_condition::WARN_LEVEL_WARN,
+				HA_WRONG_CREATE_OPTION,
+				"InnoDB: invalid PAGE_COMPRESSION_LEVEL = %lu."
+				" Valid values are [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]",
+				options->page_compression_level);
+			return "PAGE_COMPRESSION_LEVEL";
+		}
+	}
+
+	/* Check atomic writes requirements */
+	if (awrites == ATOMIC_WRITES_ON ||
+		(awrites == ATOMIC_WRITES_DEFAULT && srv_use_atomic_writes)) {
+		if (!use_tablespace) {
+			push_warning(
+				thd, Sql_condition::WARN_LEVEL_WARN,
+				HA_WRONG_CREATE_OPTION,
+				"InnoDB: ATOMIC_WRITES requires"
+				" innodb_file_per_table.");
+			return "ATOMIC_WRITES";
+		}
+	}
+
+	return 0;
 }
 
 /*****************************************************************//**
@@ -9895,6 +10142,7 @@ ha_innobase::create(
 	while creating the table. So we read the current value here
 	and make all further decisions based on this. */
 	bool		use_tablespace = srv_file_per_table;
+	const ulint     file_format    = srv_file_format;
 
 	/* Zip Shift Size - log2 - 9 of compressed page size,
 	zero for uncompressed */
@@ -9917,6 +10165,12 @@ ha_innobase::create(
 	}
 
 	/* Create the table definition in InnoDB */
+
+	/* Validate table options not handled by the SQL-parser */
+	if(check_table_options(thd, form, create_info, use_tablespace,
+			       file_format)) {
+		DBUG_RETURN(HA_WRONG_CREATE_OPTION);
+	}
 
 	/* Validate create options if innodb_strict_mode is set. */
 	if (create_options_are_invalid(
@@ -14182,6 +14436,12 @@ ha_innobase::check_if_incompatible_data(
 	HA_CREATE_INFO*	info,
 	uint		table_changes)
 {
+	ha_table_option_struct *param_old, *param_new;
+
+	/* Cache engine specific options */
+	param_new = info->option_struct;
+	param_old = table->s->option_struct;
+
 	innobase_copy_frm_flags_from_create_info(prebuilt->table, info);
 
 	if (table_changes != IS_EQUAL_YES) {
@@ -14205,6 +14465,13 @@ ha_innobase::check_if_incompatible_data(
 
 	/* Specifying KEY_BLOCK_SIZE requests a rebuild of the table. */
 	if (info->used_fields & HA_CREATE_USED_KEY_BLOCK_SIZE) {
+		return(COMPATIBLE_DATA_NO);
+	}
+
+	/* Changes on engine specific table options requests a rebuild of the table. */
+	if (param_new->page_compressed != param_old->page_compressed ||
+	    param_new->page_compression_level != param_old->page_compression_level ||
+	    param_new->atomic_writes != param_old->atomic_writes) {
 		return(COMPATIBLE_DATA_NO);
 	}
 
@@ -16381,7 +16648,7 @@ static MYSQL_SYSVAR_ULONG(replication_delay, srv_replication_delay,
 
 static MYSQL_SYSVAR_UINT(compression_level, page_zip_level,
   PLUGIN_VAR_RQCMDARG,
-  "Compression level used for compressed row format.  0 is no compression"
+  "Compression level used for zlib compression.  0 is no compression"
   ", 1 is fastest, 9 is best compression and default is 6.",
   NULL, NULL, DEFAULT_COMPRESSION_LEVEL, 0, 9, 0);
 
@@ -16895,6 +17162,41 @@ static MYSQL_SYSVAR_ULONG(saved_page_number_debug,
   NULL, innodb_save_page_no, 0, 0, UINT_MAX32, 0);
 #endif /* UNIV_DEBUG */
 
+static MYSQL_SYSVAR_BOOL(use_trim, srv_use_trim,
+  PLUGIN_VAR_OPCMDARG,
+  "Use trim. Default FALSE.",
+  NULL, NULL, FALSE);
+
+static const char *page_compression_algorithms[]= { "none", "zlib", "lz4", "lzo", "lzma", "bzip2", 0 };
+static TYPELIB page_compression_algorithms_typelib=
+{
+  array_elements(page_compression_algorithms) - 1, 0,
+  page_compression_algorithms, 0
+};
+static MYSQL_SYSVAR_ENUM(compression_algorithm, innodb_compression_algorithm,
+  PLUGIN_VAR_OPCMDARG,
+  "Compression algorithm used on page compression. One of: none, zlib, lz4, lzo, lzma, or bzip2",
+  innodb_compression_algorithm_validate, NULL,
+  /* We use here the largest number of supported compression method to
+  enable all those methods that are available. Availability of compression
+  method is verified on innodb_compression_algorithm_validate function. */
+  PAGE_UNCOMPRESSED,
+  &page_compression_algorithms_typelib);
+
+static MYSQL_SYSVAR_LONG(mtflush_threads, srv_mtflush_threads,
+  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+  "Number of multi-threaded flush threads",
+  NULL, NULL,
+  MTFLUSH_DEFAULT_WORKER, /* Default setting */
+  1,                      /* Minimum setting */
+  MTFLUSH_MAX_WORKER,     /* Max setting */
+  0);
+
+static MYSQL_SYSVAR_BOOL(use_mtflush, srv_use_mtflush,
+  PLUGIN_VAR_NOCMDARG | PLUGIN_VAR_READONLY,
+  "Use multi-threaded flush. Default FALSE.",
+  NULL, NULL, FALSE);
+
 static MYSQL_SYSVAR_UINT(simulate_comp_failures, srv_simulate_comp_failures,
   PLUGIN_VAR_NOCMDARG,
   "Simulate compression failures.",
@@ -17059,6 +17361,10 @@ static struct st_mysql_sys_var* innobase_system_variables[]= {
   MYSQL_SYSVAR(fil_make_page_dirty_debug),
   MYSQL_SYSVAR(saved_page_number_debug),
 #endif /* UNIV_DEBUG */
+  MYSQL_SYSVAR(use_trim),
+  MYSQL_SYSVAR(compression_algorithm),
+  MYSQL_SYSVAR(mtflush_threads),
+  MYSQL_SYSVAR(use_mtflush),
   MYSQL_SYSVAR(simulate_comp_failures),
   NULL
 };
@@ -17402,6 +17708,9 @@ ib_senderrf(
 	case IB_LOG_LEVEL_FATAL:
 		l = 0;
 		break;
+	default:
+		l = 0;
+		break;
 	}
 
         my_printv_error(code, format, MYF(l), args);
@@ -17559,3 +17868,94 @@ innobase_convert_to_system_charset(
                           static_cast<uint>(len), errors));
 }
 
+/*************************************************************//**
+Check for a valid value of innobase_compression_algorithm.
+@return	0 for valid innodb_compression_algorithm. */
+static
+int
+innodb_compression_algorithm_validate(
+/*==================================*/
+	THD*				thd,	/*!< in: thread handle */
+	struct st_mysql_sys_var*	var,	/*!< in: pointer to system
+						variable */
+	void*				save,	/*!< out: immediate result
+						for update function */
+	struct st_mysql_value*		value)	/*!< in: incoming string */
+{
+	long		compression_algorithm;
+	DBUG_ENTER("innobase_compression_algorithm_validate");
+
+	if (value->value_type(value) == MYSQL_VALUE_TYPE_STRING) {
+		char buff[STRING_BUFFER_USUAL_SIZE];
+		const char *str;
+		int length= sizeof(buff);
+
+		if (!(str= value->val_str(value, buff, &length))) {
+			DBUG_RETURN(1);
+		}
+
+		if ((compression_algorithm= (long)find_type(str, &page_compression_algorithms_typelib, 0) - 1) < 0) {
+			DBUG_RETURN(1);
+		}
+	} else {
+		long long tmp;
+
+		if (value->val_int(value, &tmp)) {
+			DBUG_RETURN(1);
+		}
+
+		if (tmp < 0 || tmp >= page_compression_algorithms_typelib.count) {
+			DBUG_RETURN(1);
+		}
+
+		compression_algorithm= (long) tmp;
+	}
+
+	*reinterpret_cast<ulong*>(save) = compression_algorithm;
+
+#ifndef HAVE_LZ4
+	if (compression_algorithm == PAGE_LZ4_ALGORITHM) {
+		push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,
+				    HA_ERR_UNSUPPORTED,
+				    "InnoDB: innodb_compression_algorithm = %lu unsupported.\n"
+				    "InnoDB: liblz4 is not installed. \n",
+				    compression_algorithm);
+		DBUG_RETURN(1);
+	}
+#endif
+
+#ifndef HAVE_LZO
+	if (compression_algorithm == PAGE_LZO_ALGORITHM) {
+		push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,
+				    HA_ERR_UNSUPPORTED,
+				    "InnoDB: innodb_compression_algorithm = %lu unsupported.\n"
+				    "InnoDB: liblzo is not installed. \n",
+				    compression_algorithm);
+		DBUG_RETURN(1);
+	}
+#endif
+
+#ifndef HAVE_LZMA
+	if (compression_algorithm == PAGE_LZMA_ALGORITHM) {
+		push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,
+				    HA_ERR_UNSUPPORTED,
+				    "InnoDB: innodb_compression_algorithm = %lu unsupported.\n"
+				    "InnoDB: liblzma is not installed. \n",
+				    compression_algorithm);
+		DBUG_RETURN(1);
+	}
+#endif
+
+#ifndef HAVE_BZIP2
+	if (compression_algorithm == PAGE_BZIP2_ALGORITHM) {
+		push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,
+				    HA_ERR_UNSUPPORTED,
+				    "InnoDB: innodb_compression_algorithm = %lu unsupported.\n"
+				    "InnoDB: libbz2 is not installed. \n",
+				    compression_algorithm);
+		DBUG_RETURN(1);
+	}
+#endif
+
+	DBUG_RETURN(0);
+}
